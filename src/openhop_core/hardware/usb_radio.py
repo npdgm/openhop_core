@@ -1,7 +1,7 @@
 """
 USB LoRa Radio Driver for openhop_core
 
-Implements the LoRaRadio interface using a pymc_usb modem connected via
+Implements the LoRaRadio interface using an openHop Modem connected via
 USB-CDC. The modem acts as a "dumb" SX1262 transceiver — all MeshCore
 protocol logic runs on the host in openhop_core.
 
@@ -30,6 +30,7 @@ Usage:
 
 import asyncio
 import logging
+import os
 import random
 import struct
 import threading
@@ -37,6 +38,7 @@ import time
 from typing import Callable, Optional
 
 import serial
+from serial.tools import list_ports
 
 from .protocol_constants import (
     CMD_CAD_PARAMS_RESP,
@@ -64,6 +66,7 @@ from .protocol_constants import (
     CMD_VERSION_RESP,
     CMD_WIFI_RESET,
     CMD_WIFI_STATUS,
+    ERR_CHANNEL_BUSY,
     MAX_LORA_PAYLOAD,
     PROTO_SYNC,
     RADIO_CONFIG_FMT,
@@ -102,11 +105,11 @@ else:
 
 
 class USBLoRaRadio(_RadioBase):
-    """USB LoRa Radio — pymc_core LoRaRadio interface over USB-CDC serial.
+    """USB LoRa Radio — openhop_core LoRaRadio interface over USB-CDC serial.
 
-    Communicates with any board running the pymc_usb firmware over a
-    USB-CDC serial link. Provides the same interface as SX1262Radio for
-    transparent integration with pymc_core's Dispatcher and MeshNode.
+    Communicates with an openHop Modem over a USB-CDC serial link.
+    Provides the same interface as SX1262Radio for
+    transparent integration with openhop_core's Dispatcher and MeshNode.
     """
 
     def __init__(
@@ -122,6 +125,8 @@ class USBLoRaRadio(_RadioBase):
         preamble_length: int = 16,
         lbt_enabled: bool = True,
         lbt_max_attempts: int = 5,
+        lbt_max_wait_seconds: float = 4.0,
+        lbt_retry_interval_ms: int = 200,
     ):
         self.port = port
         self.baudrate = baudrate
@@ -135,16 +140,27 @@ class USBLoRaRadio(_RadioBase):
         self.sync_word = sync_word
         self.preamble_length = preamble_length
 
-        # LBT (Listen Before Talk) via CAD
+        # LBT (Listen Before Talk) via CAD, bounded in TIME rather than
+        # attempts, so an occupation longer than the budget cannot leave two
+        # neighbours forcing their TX in lockstep. Defaults match MeshCore
+        # (4 s cap, 200 ms retry); the jitter keeps two nodes decorrelated.
+        # lbt_max_attempts is accepted for call-site compatibility only.
         self.lbt_enabled = lbt_enabled
         self.lbt_max_attempts = lbt_max_attempts
+        self.lbt_max_wait_seconds = max(0.5, float(lbt_max_wait_seconds))
+        self.lbt_retry_interval_ms = max(20, int(lbt_retry_interval_ms))
+        # Last CMD_ERROR code seen, so send() can tell a firmware-side
+        # auto-CAD refusal (ERR_CHANNEL_BUSY) from a real TX failure.
+        self._last_modem_error = None  # int error code, or None
 
         # State
         self._serial: Optional[serial.Serial] = None
         self._initialized = False
         self._rx_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        self._connected_event = threading.Event()
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._port_identity: Optional[tuple[Optional[int], Optional[int], Optional[str]]] = None
 
         # Signal metrics — matches SX1262Radio interface
         self.last_rssi: int = -99
@@ -159,6 +175,11 @@ class USBLoRaRadio(_RadioBase):
         self._response_events: dict[int, asyncio.Event] = {}
         self._response_data: dict[int, Optional[bytes]] = {}
         self._response_lock = threading.Lock()
+        # Only one command may wait for a response at a time. Repeater applies
+        # CAD thresholds and symbol count back-to-back, and both commands wait
+        # for CMD_CAD_PARAMS_RESP. Without serialization the second waiter
+        # replaces the first entry in _response_events and one update times out.
+        self._command_lock = asyncio.Lock()
 
         # Custom CAD thresholds. Set lazily by set_custom_cad_thresholds()
         # or perform_cad(det_peak=..., det_min=...); kept in attributes from
@@ -187,6 +208,12 @@ class USBLoRaRadio(_RadioBase):
     # LoRaRadio interface implementation
     # ══════════════════════════════════════════════════════════
 
+    def _lbt_retry_delay_ms(self, deadline: float) -> float:
+        """One short jittered LBT retry delay, clamped to the remaining budget."""
+        delay_ms = self.lbt_retry_interval_ms * random.uniform(0.5, 1.5)
+        remaining_ms = (deadline - time.monotonic()) * 1000.0
+        return max(0.0, min(delay_ms, remaining_ms))
+
     def begin(self) -> bool:
         """Initialize USB serial connection and configure the modem radio."""
         if self._initialized:
@@ -200,14 +227,7 @@ class USBLoRaRadio(_RadioBase):
             # (re-)open the port. dsrdtr=True is the workaround; rtscts
             # stays off because the firmware does not implement hardware
             # flow control on the RX pipe.
-            self._serial = serial.Serial()
-            self._serial.port = self.port
-            self._serial.baudrate = self.baudrate
-            self._serial.timeout = 0.1
-            self._serial.write_timeout = 2.0
-            self._serial.dsrdtr = True
-            self._serial.rtscts = False
-            self._serial.open()
+            self._serial = self._open_serial_sync()
 
             # Short settle in case the caller just power-cycled the device.
             time.sleep(0.3)
@@ -227,6 +247,8 @@ class USBLoRaRadio(_RadioBase):
                 self._serial.close()
                 return False
 
+            self._connected_event.set()
+
             # Start RX background thread
             self._stop_event.clear()
             self._rx_thread = threading.Thread(
@@ -239,6 +261,7 @@ class USBLoRaRadio(_RadioBase):
             return True
 
         except Exception as e:
+            self._connected_event.clear()
             logger.error(f"Failed to initialize USBLoRaRadio: {e}")
             if self._serial and self._serial.is_open:
                 self._serial.close()
@@ -251,7 +274,7 @@ class USBLoRaRadio(_RadioBase):
             {
                 "airtime_ms": float,
                 "lbt_attempts": int,
-                "lbt_backoff_delays_ms": list[float],
+                "lbt_backoff_delays_ms": list[int],
                 "lbt_channel_busy": bool,
             }
         Returns None on failure.
@@ -261,40 +284,95 @@ class USBLoRaRadio(_RadioBase):
             return None
 
         async with self._tx_lock:
-            lbt_backoff_delays: list[float] = []
+            # Log taxonomy, shared with the SPI radio: [LBT] is the
+            # listen-before-talk retry loop, [CAD] a single channel-activity
+            # scan, [TX] the transmit path. A nominal TX logs two DEBUG lines
+            # ("[LBT] Summary" and "[TX] Done"); contention adds bounded
+            # DEBUG retries, anomalies log at WARNING, failed sends at ERROR.
+            lbt_backoff_delays: list[int] = []
 
             # ── Listen Before Talk (CAD) ─────────────────────
+            # Bounded in TIME rather than attempts: short jittered retries run
+            # for the whole budget. The deadline is shared with the
+            # ERR_CHANNEL_BUSY retry below, so firmware-side auto-CAD refusals
+            # draw from the same budget.
+            lbt_deadline = time.monotonic() + self.lbt_max_wait_seconds
+            cad_checks = 0
+            modem_refusals = 0
+            outcome = "clear" if self.lbt_enabled else "off"
             if self.lbt_enabled:
-                for attempt in range(self.lbt_max_attempts):
-                    try:
-                        channel_busy = await self._perform_cad(timeout=1.0)
-                        if not channel_busy:
-                            logger.debug(f"CAD clear after {attempt + 1} attempt(s)")
-                            break
-                        else:
-                            logger.debug("CAD busy — channel activity detected")
-                            if attempt < self.lbt_max_attempts - 1:
-                                base_delay = random.randint(50, 200)
-                                backoff_ms = min(base_delay * (2**attempt), 5000)
-                                lbt_backoff_delays.append(float(backoff_ms))
-                                logger.debug(
-                                    f"CAD backoff {backoff_ms}ms "
-                                    f"(attempt {attempt + 1}/{self.lbt_max_attempts})"
-                                )
-                                await asyncio.sleep(backoff_ms / 1000.0)
-                            else:
-                                logger.warning("CAD max attempts — transmitting anyway")
-                    except Exception as e:
-                        logger.warning(f"CAD failed: {e}, proceeding with TX")
+                while True:
+                    remaining = lbt_deadline - time.monotonic()
+                    if remaining <= 0:
+                        outcome = "forced"
+                        logger.warning(
+                            f"[LBT] Budget exhausted ({self.lbt_max_wait_seconds:.1f}s) - "
+                            "channel still busy, transmitting anyway"
+                        )
                         break
+                    try:
+                        cad_checks += 1
+                        channel_busy = await self._perform_cad(timeout=min(1.0, remaining))
+                    except Exception as e:
+                        outcome = "exception"
+                        logger.warning(
+                            f"[LBT] Channel check failed: {e}, proceeding with transmission"
+                        )
+                        break
+                    if not channel_busy:
+                        break
+                    if time.monotonic() >= lbt_deadline:
+                        outcome = "forced"
+                        logger.warning(
+                            f"[LBT] Budget exhausted ({self.lbt_max_wait_seconds:.1f}s) - "
+                            "channel still busy, transmitting anyway"
+                        )
+                        break
+                    delay_ms = self._lbt_retry_delay_ms(lbt_deadline)
+                    lbt_backoff_delays.append(round(delay_ms))
+                    logger.debug(f"[LBT] Channel busy - retrying in {delay_ms:.0f}ms")
+                    await asyncio.sleep(delay_ms / 1000.0)
 
             # ── Transmit ─────────────────────────────────────
             try:
-                resp = await self._send_command(
-                    CMD_TX_REQUEST,
-                    data,
-                    expect_cmd=CMD_TX_DONE,
-                    timeout=10.0,
+                while True:
+                    self._last_modem_error = None
+                    resp = await self._send_command(
+                        CMD_TX_REQUEST,
+                        data,
+                        expect_cmd=CMD_TX_DONE,
+                        timeout=10.0,
+                    )
+                    if resp is not None:
+                        break
+                    # Firmware-side auto-CAD (CMD_SET_AUTO_CAD) refuses a busy
+                    # channel with ERR_CHANNEL_BUSY instead of trampling a
+                    # neighbour. That is LBT feedback, not a failure: retry
+                    # within the same time budget the host-side loop uses.
+                    if (
+                        self._last_modem_error == ERR_CHANNEL_BUSY
+                        and time.monotonic() < lbt_deadline
+                    ):
+                        modem_refusals += 1
+                        delay_ms = self._lbt_retry_delay_ms(lbt_deadline)
+                        lbt_backoff_delays.append(round(delay_ms))
+                        logger.debug(
+                            f"[LBT] Modem reports channel busy - retrying TX in {delay_ms:.0f}ms"
+                        )
+                        await asyncio.sleep(delay_ms / 1000.0)
+                        continue
+                    if self._last_modem_error == ERR_CHANNEL_BUSY:
+                        # Unlike the host-side loop there is nothing to force
+                        # here: the modem is alive and refusing, not wedged.
+                        outcome = "refused"
+                        modem_refusals += 1
+                        logger.warning("[LBT] Modem refused TX - channel busy for the whole budget")
+                    break
+
+                logger.debug(
+                    f"[LBT] Summary: outcome={outcome} cad_checks={cad_checks} "
+                    f"modem_refusals={modem_refusals} "
+                    f"backoff_total={sum(lbt_backoff_delays):.0f}ms"
                 )
 
                 if resp is not None:
@@ -306,7 +384,7 @@ class USBLoRaRadio(_RadioBase):
                         airtime_us = struct.unpack("<I", resp[:4])[0]
                     airtime_ms = airtime_us / 1000.0
 
-                    logger.debug(f"TX done: {len(data)}B, airtime={airtime_ms:.1f}ms")
+                    logger.debug(f"[TX] Done {len(data)}B airtime={airtime_ms:.0f}ms")
 
                     # Restore RX continuous mode
                     await self._send_command(
@@ -323,7 +401,7 @@ class USBLoRaRadio(_RadioBase):
                         "lbt_channel_busy": len(lbt_backoff_delays) > 0,
                     }
                 else:
-                    logger.error("TX failed — no TX_DONE response")
+                    logger.error("[TX] Failed - no TX_DONE response")
                     # Try to restore RX anyway
                     await self._send_command(
                         CMD_RX_START,
@@ -334,7 +412,7 @@ class USBLoRaRadio(_RadioBase):
                     return None
 
             except Exception as e:
-                logger.error(f"TX error: {e}")
+                logger.error(f"[TX] Error: {e}")
                 return None
 
     async def wait_for_rx(self) -> bytes:
@@ -342,6 +420,10 @@ class USBLoRaRadio(_RadioBase):
         raise NotImplementedError(
             "Use set_rx_callback(callback) to receive packets asynchronously."
         )
+
+    def set_event_loop(self, loop) -> None:
+        """Set the event loop used for callbacks and live configuration pushes."""
+        self._event_loop = loop
 
     def set_rx_callback(self, callback: Callable[[bytes], None]):
         """Set RX callback — called by Dispatcher to register _on_packet_received."""
@@ -377,7 +459,7 @@ class USBLoRaRadio(_RadioBase):
         Called by Dispatcher.run_forever() every 60 seconds.
         Also refreshes cached modem metrics from the modem.
         """
-        if not self._initialized:
+        if not self._initialized or not self._connected_event.is_set():
             return False
 
         # Check RX thread
@@ -400,8 +482,10 @@ class USBLoRaRadio(_RadioBase):
 
     def get_status(self) -> dict:
         """Get radio status dict (matches SX1262Radio.get_status())."""
+        connected_event = getattr(self, "_connected_event", None)
+        connected = self._initialized and (connected_event is None or connected_event.is_set())
         return {
-            "initialized": self._initialized,
+            "initialized": connected,
             "frequency": self.frequency,
             "tx_power": self.tx_power,
             "spreading_factor": self.spreading_factor,
@@ -410,8 +494,8 @@ class USBLoRaRadio(_RadioBase):
             "last_rssi": self.last_rssi,
             "last_snr": self.last_snr,
             "last_signal_rssi": self.last_signal_rssi,
-            "hardware_ready": self._initialized,
-            "driver": "pymc_usb",
+            "hardware_ready": connected,
+            "driver": "modem_usb",
             "port": self.port,
             "tx_count": self._tx_count,
             "rx_count": self._rx_count,
@@ -537,12 +621,6 @@ class USBLoRaRadio(_RadioBase):
         # raise the floor so we don't lose samples to "no response".
         effective = max(timeout, 0.6)
         return await self._perform_cad(effective)
-
-    def set_custom_cad_symbol_num(self, cad_symbol_num: int) -> bool:
-        """Store a validated CAD symbol count for calls that omit an override."""
-        build_cad_params_payload(cad_symbol_num, 0, 0)
-        self._custom_cad_symbol_num = int(cad_symbol_num)
-        return True
 
     # ── Wi-Fi / OTA provisioning (v0.5) ───────────────────────
 
@@ -680,6 +758,7 @@ class USBLoRaRadio(_RadioBase):
     def cleanup(self):
         """Clean up resources."""
         self._initialized = False
+        self._connected_event.clear()
         self._stop_event.set()
 
         if self._rx_thread and self._rx_thread.is_alive():
@@ -693,6 +772,76 @@ class USBLoRaRadio(_RadioBase):
     # ══════════════════════════════════════════════════════════
     # Private — serial I/O
     # ══════════════════════════════════════════════════════════
+
+    def _capture_port_identity(self, device: str) -> None:
+        """Remember stable USB identity so tty renumbering can be followed."""
+        real_device = os.path.realpath(device)
+        for info in list_ports.comports():
+            if os.path.realpath(info.device) == real_device:
+                self._port_identity = (info.vid, info.pid, info.serial_number)
+                return
+
+    def _resolve_serial_port(self) -> str:
+        """Resolve the configured modem after USB re-enumeration."""
+        if self._port_identity is not None:
+            expected_vid, expected_pid, expected_serial = self._port_identity
+            for info in list_ports.comports():
+                if info.vid != expected_vid or info.pid != expected_pid:
+                    continue
+                if expected_serial and info.serial_number != expected_serial:
+                    continue
+                return info.device
+        return self.port
+
+    def _open_serial_sync(self) -> serial.Serial:
+        """Open a configured serial handle without starting the RX worker."""
+        device = self._resolve_serial_port()
+        handle = serial.Serial()
+        handle.port = device
+        handle.baudrate = self.baudrate
+        handle.timeout = 0.1
+        handle.write_timeout = 2.0
+        handle.dsrdtr = True
+        handle.rtscts = False
+        handle.open()
+        self._capture_port_identity(device)
+        return handle
+
+    def _reconnect_serial_sync(self) -> bool:
+        """Reopen a re-enumerated USB modem and restore radio/CAD state."""
+        if self._serial is not None:
+            try:
+                self._serial.close()
+            except Exception:
+                pass
+
+        attempt = 0
+        while not self._stop_event.is_set():
+            attempt += 1
+            try:
+                self._serial = self._open_serial_sync()
+                time.sleep(0.3)
+                self._serial.reset_input_buffer()
+                if not self._apply_config_sync():
+                    raise RuntimeError("modem did not acknowledge restored configuration")
+                self._connected_event.set()
+                logger.info(
+                    "USB modem reconnected on %s after %s attempt(s)",
+                    self._serial.port,
+                    attempt,
+                )
+                return True
+            except Exception as exc:
+                self._connected_event.clear()
+                if self._serial is not None:
+                    try:
+                        self._serial.close()
+                    except Exception:
+                        pass
+                if attempt == 1 or attempt % 10 == 0:
+                    logger.warning("USB modem reconnect attempt %s failed: %s", attempt, exc)
+                self._stop_event.wait(2.0)
+        return False
 
     def _ping_sync(self, timeout: float = 3.0) -> bool:
         """Synchronous ping — ad-hoc liveness probe.
@@ -736,6 +885,8 @@ class USBLoRaRadio(_RadioBase):
                 f"BW{self.bandwidth / 1000:.0f}kHz {self.tx_power}dBm "
                 f"sync=0x{self.sync_word:04X} pre={self.preamble_length}"
             )
+            if not self._apply_cad_config_sync():
+                logger.warning("Radio configured but cached CAD settings were not restored")
             return True
         elif resp and resp[0] == CMD_ERROR:
             err = resp[1][0] if len(resp) > 1 and len(resp[1]) > 0 else 0xFF
@@ -744,6 +895,28 @@ class USBLoRaRadio(_RadioBase):
         else:
             logger.error("No config response from modem")
             return False
+
+    def _write_cad_frame_sync(self, payload: bytes) -> bool:
+        """Push one complete CAD configuration before the RX worker starts."""
+        if self._serial is None:
+            return False
+        self._serial.write(build_frame(CMD_SET_CAD_PARAMS, payload))
+        resp = self._read_frame_sync(timeout=3.0, expect_cmd=CMD_CAD_PARAMS_RESP)
+        if resp and resp[0] == CMD_CAD_PARAMS_RESP:
+            return True
+        logger.error("No CAD configuration response from modem")
+        return False
+
+    def _apply_cad_config_sync(self) -> bool:
+        """Restore cached CAD settings during initial attach or re-attach."""
+        if self._custom_cad_peak is None or self._custom_cad_min is None:
+            return True
+        payload = build_cad_params_payload(
+            self._custom_cad_symbol_num or 2,
+            self._custom_cad_peak,
+            self._custom_cad_min,
+        )
+        return self._write_cad_frame_sync(payload)
 
     def _read_frame_sync(
         self,
@@ -876,9 +1049,12 @@ class USBLoRaRadio(_RadioBase):
 
                     self._dispatch_frame(cmd, payload)
 
-            except serial.SerialException as e:
-                logger.error(f"Serial error in RX worker: {e}")
-                time.sleep(1.0)
+            except (serial.SerialException, OSError) as e:
+                buf.clear()
+                self._connected_event.clear()
+                logger.warning("USB modem disconnected: %s", e)
+                if not self._reconnect_serial_sync():
+                    break
             except Exception as e:
                 logger.error(f"RX worker error: {e}")
                 time.sleep(0.1)
@@ -920,7 +1096,12 @@ class USBLoRaRadio(_RadioBase):
 
         elif cmd == CMD_ERROR:
             err_code = payload[0] if len(payload) > 0 else 0xFF
-            logger.warning(f"Modem error: 0x{err_code:02X}")
+            if err_code == ERR_CHANNEL_BUSY:
+                # LBT feedback, not an anomaly: the send loop retries it.
+                logger.debug(f"Modem error: 0x{err_code:02X} (channel busy)")
+            else:
+                logger.warning(f"Modem error: 0x{err_code:02X}")
+            self._last_modem_error = err_code
             # Also signal any waiting command in case the error
             # is a response to our command
             with self._response_lock:
@@ -934,7 +1115,7 @@ class USBLoRaRadio(_RadioBase):
             # TX_DONE before the firmware's own timeout. Wake up whoever is
             # blocked on CMD_TX_DONE so the caller doesn't sit on the full
             # driver timeout.
-            logger.warning("Modem TX_FAIL — radio did not assert TX_DONE")
+            logger.warning("[TX] Modem TX_FAIL - radio did not assert TX_DONE")
             with self._response_lock:
                 evt = self._response_events.get(CMD_TX_DONE)
                 if evt is not None:
@@ -961,39 +1142,40 @@ class USBLoRaRadio(_RadioBase):
         timeout: float = 5.0,
     ) -> Optional[bytes]:
         """Send a command frame and wait for a specific response frame."""
-        if not self._serial or not self._serial.is_open:
-            return None
-
-        # Ensure event loop is captured
-        if self._event_loop is None:
-            try:
-                self._event_loop = asyncio.get_running_loop()
-            except RuntimeError:
-                pass
-
-        # Register response expectation
-        evt = asyncio.Event()
-        with self._response_lock:
-            self._response_events[expect_cmd] = evt
-            self._response_data.pop(expect_cmd, None)
-
-        try:
-            frame = build_frame(cmd, payload)
-            self._serial.write(frame)
-            self._serial.flush()
-
-            try:
-                await asyncio.wait_for(evt.wait(), timeout=timeout)
-            except asyncio.TimeoutError:
-                logger.warning(f"Timeout: cmd=0x{cmd:02X} → expected 0x{expect_cmd:02X}")
+        async with self._command_lock:
+            if not self._connected_event.is_set() or not self._serial or not self._serial.is_open:
                 return None
 
-            return self._response_data.get(expect_cmd)
+            # Ensure event loop is captured
+            if self._event_loop is None:
+                try:
+                    self._event_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    pass
 
-        finally:
+            # Register response expectation
+            evt = asyncio.Event()
             with self._response_lock:
-                self._response_events.pop(expect_cmd, None)
+                self._response_events[expect_cmd] = evt
                 self._response_data.pop(expect_cmd, None)
+
+            try:
+                frame = build_frame(cmd, payload)
+                self._serial.write(frame)
+                self._serial.flush()
+
+                try:
+                    await asyncio.wait_for(evt.wait(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout: cmd=0x{cmd:02X} → expected 0x{expect_cmd:02X}")
+                    return None
+
+                return self._response_data.get(expect_cmd)
+
+            finally:
+                with self._response_lock:
+                    self._response_events.pop(expect_cmd, None)
+                    self._response_data.pop(expect_cmd, None)
 
     async def _perform_cad(self, timeout: float = 1.0) -> bool:
         """Perform Channel Activity Detection. Returns True if busy."""
@@ -1005,13 +1187,85 @@ class USBLoRaRadio(_RadioBase):
         )
         if resp and len(resp) >= 1:
             busy = resp[0] != 0
-            logger.debug(f"CAD: {'BUSY' if busy else 'CLEAR'}")
+            logger.debug(
+                "[CAD] BUSY - channel activity detected"
+                if busy
+                else "[CAD] CLEAR - no channel activity detected"
+            )
             return busy
         else:
-            logger.warning("CAD no response — assuming clear")
+            logger.warning("[CAD] No response - assuming clear")
             return False
 
     # ── Config setters (for runtime reconfiguration) ──────────
+
+    def _run_async_safe(self, coro, wait_timeout: float = 4.0) -> bool:
+        """Schedule a command on the radio event loop from any caller thread."""
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is self._event_loop:
+
+            async def _bg():
+                try:
+                    response = await coro
+                    logger.info("Async CAD config push result: ok=%s", response is not None)
+                except Exception as exc:
+                    logger.error("Async CAD config push error: %s", exc, exc_info=True)
+
+            asyncio.ensure_future(_bg())
+            return True
+        if self._event_loop is None:
+            coro.close()
+            return False
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, self._event_loop)
+            return future.result(timeout=wait_timeout) is not None
+        except Exception as exc:
+            logger.error("Cross-thread CAD config push error: %s", exc, exc_info=True)
+            return False
+
+    def _push_cad_config_live(self) -> bool:
+        """Push the complete cached CAD tuple when the modem is connected."""
+        if self._custom_cad_peak is None or self._custom_cad_min is None:
+            return True
+        if not self._initialized:
+            return True
+        if self._event_loop is None or not self._event_loop.is_running():
+            return True
+        payload = build_cad_params_payload(
+            self._custom_cad_symbol_num or 2,
+            self._custom_cad_peak,
+            self._custom_cad_min,
+        )
+        return self._run_async_safe(
+            self._send_command(
+                CMD_SET_CAD_PARAMS,
+                payload,
+                expect_cmd=CMD_CAD_PARAMS_RESP,
+                timeout=3.0,
+            )
+        )
+
+    def set_custom_cad_thresholds(self, peak: int, min_val: int) -> bool:
+        """Cache and live-apply custom CAD detection thresholds."""
+        if not (0 <= int(peak) <= 255) or not (0 <= int(min_val) <= 255):
+            raise ValueError("CAD thresholds must be between 0 and 255")
+        self._custom_cad_peak = int(peak)
+        self._custom_cad_min = int(min_val)
+        return self._push_cad_config_live()
+
+    def set_custom_cad_symbol_num(self, cad_symbol_num: int) -> bool:
+        """Cache and live-apply a validated CAD symbol count."""
+        build_cad_params_payload(cad_symbol_num, 0, 0)
+        self._custom_cad_symbol_num = int(cad_symbol_num)
+        return self._push_cad_config_live()
+
+    def clear_custom_cad_thresholds(self) -> None:
+        """Clear host-side CAD thresholds; firmware resets on modem reboot."""
+        self._custom_cad_peak = None
+        self._custom_cad_min = None
 
     def set_frequency(self, frequency: int) -> bool:
         self.frequency = frequency
