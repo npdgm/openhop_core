@@ -495,7 +495,6 @@ class SX1262Radio(LoRaRadio):
                 # Only wake the background task for TERMINAL interrupts
                 # Intermediate interrupts (preamble, sync, header valid) are just progress updates
                 if irqStat & terminal_interrupts:
-                    # Event has no counter: a suppressed wake-up is lost.
                     if not self._tx_buffer_busy:
                         self._rx_done_event.set()
                         _trace(f"[RX] Terminal interrupt 0x{irqStat:04X} - waking background task")
